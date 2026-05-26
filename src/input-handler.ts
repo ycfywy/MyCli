@@ -1,7 +1,7 @@
 import * as readline from 'readline';
 import chalk from 'chalk';
-import { readFileSync, existsSync } from 'fs';
 import { ContentPart } from './ai-client.js';
+import { FileSuggestion, getFileSuggestions, parseReferencesToContent } from './file-references.js';
 
 const ALL_COMMANDS = [
   '/help', '/model', '/skills', '/skill', '/new', '/history', '/config',
@@ -53,6 +53,8 @@ export class InputHandler {
       let lastHintLines = 0;
       let completionPrefix: string | null = null;
       let selectedCommandIndex = -1;
+      let referencePrefix: string | null = null;
+      let selectedReferenceIndex = -1;
       const stdin = process.stdin;
       const stdout = process.stdout;
       const previousRawMode = stdin.isRaw;
@@ -65,9 +67,20 @@ export class InputHandler {
         if (!prefix.startsWith('/') || prefix.includes(' ')) return [];
         return ALL_COMMANDS.filter((cmd) => cmd.startsWith(prefix.toLowerCase())).slice(0, 8);
       };
-      const resetCompletion = () => {
+      const activeReference = () => this.getActiveReference(line);
+      const activeReferenceQuery = () => referencePrefix ?? activeReference()?.query ?? '';
+      const referenceMatches = () => getFileSuggestions(activeReferenceQuery());
+      const resetCommandCompletion = () => {
         completionPrefix = null;
         selectedCommandIndex = -1;
+      };
+      const resetReferenceCompletion = () => {
+        referencePrefix = null;
+        selectedReferenceIndex = -1;
+      };
+      const resetCompletion = () => {
+        resetCommandCompletion();
+        resetReferenceCompletion();
       };
 
       const clearHints = () => {
@@ -84,7 +97,10 @@ export class InputHandler {
         clearHints();
         stdout.write(`\r\x1B[2K${promptText}${displayLine()}`);
 
-        const hints = this.getCommandHints(activePrefix(), selectedCommandIndex);
+        const reference = activeReference();
+        const hints = reference
+          ? this.getFileReferenceHints(referenceMatches(), selectedReferenceIndex)
+          : this.getCommandHints(activePrefix(), selectedCommandIndex);
         if (hints.length > 0) {
           for (const hint of hints) {
             stdout.write(`\n\r\x1B[2K${hint}`);
@@ -129,6 +145,80 @@ export class InputHandler {
         }
 
         line = matches[selectedCommandIndex];
+        render();
+        return true;
+      };
+
+      const applyReferenceSuggestion = (suggestion: FileSuggestion, finalizeFile = false) => {
+        const ref = activeReference();
+        if (!ref) return;
+        const suffix = finalizeFile && !suggestion.isDirectory ? ' ' : '';
+        line = `${line.slice(0, ref.start)}@${suggestion.value}${suffix}${line.slice(ref.end)}`;
+      };
+
+      const acceptReferenceSuggestion = (suggestion: FileSuggestion) => {
+        applyReferenceSuggestion(suggestion, !suggestion.isDirectory);
+        resetReferenceCompletion();
+        render();
+      };
+
+      const selectReference = (direction: 1 | -1) => {
+        const ref = activeReference();
+        if (!ref) return false;
+        if (referencePrefix === null) {
+          referencePrefix = ref.query;
+        }
+
+        const matches = referenceMatches();
+        if (matches.length === 0) return false;
+
+        if (selectedReferenceIndex < 0) {
+          selectedReferenceIndex = direction === 1 ? 0 : matches.length - 1;
+        } else {
+          selectedReferenceIndex = (selectedReferenceIndex + direction + matches.length) % matches.length;
+        }
+
+        applyReferenceSuggestion(matches[selectedReferenceIndex]);
+        render();
+        return true;
+      };
+
+      const completeReference = () => {
+        const ref = activeReference();
+        if (!ref) return false;
+
+        // 如果用户已经用 ↑/↓ 选中了候选项，Tab 表示接受当前项：
+        // - 文件：完成引用，并追加空格退出 @ 补全
+        // - 目录：进入该目录，展示下一级候选
+        if (referencePrefix !== null && selectedReferenceIndex >= 0) {
+          const selected = referenceMatches()[selectedReferenceIndex];
+          if (selected) {
+            acceptReferenceSuggestion(selected);
+            return true;
+          }
+        }
+
+        // Tab 始终基于当前输入里的 @ 路径做补全。
+        resetReferenceCompletion();
+        const matches = getFileSuggestions(ref.query);
+        if (matches.length === 0) return false;
+
+        if (matches.length === 1) {
+          acceptReferenceSuggestion(matches[0]);
+          return true;
+        }
+
+        const commonPrefix = this.commonPrefix(matches.map((item) => item.value));
+        if (commonPrefix.length > ref.query.length) {
+          line = `${line.slice(0, ref.start)}@${commonPrefix}${line.slice(ref.end)}`;
+          resetReferenceCompletion();
+          render();
+          return true;
+        }
+
+        // 多个候选且没有公共前缀时，只高亮第一项，不直接插入，避免误引用。
+        referencePrefix = ref.query;
+        selectedReferenceIndex = 0;
         render();
         return true;
       };
@@ -180,17 +270,23 @@ export class InputHandler {
         }
 
         if (input === '\t') {
-          completeCommand();
+          if (!completeReference()) {
+            completeCommand();
+          }
           return;
         }
 
         if (input === '\x1B[A') {
-          selectCommand(-1);
+          if (!selectReference(-1)) {
+            selectCommand(-1);
+          }
           return;
         }
 
         if (input === '\x1B[B') {
-          selectCommand(1);
+          if (!selectReference(1)) {
+            selectCommand(1);
+          }
           return;
         }
 
@@ -230,7 +326,7 @@ export class InputHandler {
         const marker = item === current ? ' 当前' : '';
         console.log(`${index + 1}. ${item}${marker}`);
       });
-      const answer = await this.readLineFallback(chalk.blue.bold('选择编号或模型名 ❯ '));
+      const answer = await this.readLineFallback(chalk.blue.bold(`选择编号或${itemLabel}名 ❯ `));
       const index = Number(answer) - 1;
       if (Number.isInteger(index) && items[index]) return items[index];
       return answer.trim() || undefined;
@@ -374,6 +470,27 @@ export class InputHandler {
     });
   }
 
+  private getActiveReference(input: string): { start: number; end: number; query: string } | undefined {
+    const match = input.match(/(^|\s)@([^\s]*)$/);
+    if (!match || match.index === undefined) return undefined;
+
+    const leading = match[1] || '';
+    const query = match[2] || '';
+    const start = match.index + leading.length;
+    return { start, end: input.length, query };
+  }
+
+  private getFileReferenceHints(matches: FileSuggestion[], selectedIndex: number): string[] {
+    if (matches.length === 0) {
+      return [chalk.dim('  输入 @ 引用文件；当前目录无匹配项')];
+    }
+
+    return matches.map((item, index) => {
+      const text = `${index === selectedIndex ? '›' : ' '} ${item.label}`;
+      return index === selectedIndex ? chalk.cyan.bold(text) : chalk.dim(text);
+    });
+  }
+
   private commonPrefix(values: string[]): string {
     if (values.length === 0) return '';
     let prefix = values[0];
@@ -386,57 +503,7 @@ export class InputHandler {
   }
 
   parseImageContent(input: string): ContentPart[] | string {
-    const imageUrlRegex = /(https?:\/\/\S+\.(?:png|jpg|jpeg|gif|webp))/gi;
-    const localFileRegex = /@([\w./\-]+\.(?:png|jpg|jpeg|gif|webp))/gi;
-    const base64Regex = /(data:image\/\w+;base64,[A-Za-z0-9+/=]+)/g;
-
-    const urls = input.match(imageUrlRegex) || [];
-    const localFiles = input.match(localFileRegex) || [];
-    const base64Images = input.match(base64Regex) || [];
-
-    if (urls.length === 0 && localFiles.length === 0 && base64Images.length === 0) {
-      return input;
-    }
-
-    const parts: ContentPart[] = [];
-
-    let textContent = input;
-    for (const url of urls) textContent = textContent.replace(url, '');
-    for (const file of localFiles) textContent = textContent.replace(file, '');
-    for (const b64 of base64Images) textContent = textContent.replace(b64, '');
-
-    textContent = textContent.trim();
-    if (textContent) {
-      parts.push({ type: 'text', text: textContent });
-    }
-
-    for (const url of urls) {
-      parts.push({ type: 'image_url', image_url: { url, detail: 'auto' } });
-    }
-
-    for (const fileMatch of localFiles) {
-      const filePath = fileMatch.replace('@', '');
-      if (existsSync(filePath)) {
-        try {
-          const buffer = readFileSync(filePath);
-          const base64 = buffer.toString('base64');
-          const ext = filePath.split('.').pop()?.toLowerCase() || 'png';
-          const mimeType = ext === 'jpg' ? 'jpeg' : ext;
-          const dataUrl = `data:image/${mimeType};base64,${base64}`;
-          parts.push({ type: 'image_url', image_url: { url: dataUrl, detail: 'auto' } });
-        } catch {
-          parts.push({ type: 'text', text: `[无法读取图片: ${filePath}]` });
-        }
-      } else {
-        parts.push({ type: 'text', text: `[文件不存在: ${filePath}]` });
-      }
-    }
-
-    for (const b64 of base64Images) {
-      parts.push({ type: 'image_url', image_url: { url: b64, detail: 'auto' } });
-    }
-
-    return parts;
+    return parseReferencesToContent(input);
   }
 
   close(): void {

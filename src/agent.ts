@@ -66,7 +66,7 @@ export class Agent {
       return cmdResult.exit || false;
     }
 
-    // 解析图片内容
+    // 解析 @ 文件引用和图片内容
     const content = this.inputHandler.parseImageContent(trimmed);
 
     // 发送给 AI
